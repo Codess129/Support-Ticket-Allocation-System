@@ -1,0 +1,95 @@
+CREATE OR REPLACE PROCEDURE SUPPORT_AI.TICKETING.AUTO_ALLOCATE_TICKETS()
+RETURNS VARCHAR
+LANGUAGE SQL
+EXECUTE AS CALLER
+AS '
+DECLARE
+  tickets_assigned INT;
+BEGIN
+  -- Set-based allocation: 
+  -- 1. Find eligible engineers (on-shift in BST, have capacity)
+  -- 2. Match to unassigned tickets by language
+  -- 3. Assign to the lowest-loaded engineer, respecting capacity limits
+  
+  -- Use a MERGE to assign tickets in one pass
+  -- First, create a temp mapping of tickets to best engineers
+  CREATE OR REPLACE TEMPORARY TABLE SUPPORT_AI.TICKETING.TEMP_ASSIGNMENTS AS
+  WITH bst_current AS (
+    SELECT TIME(CONVERT_TIMEZONE(''UTC'', ''Europe/London'', CURRENT_TIMESTAMP())) AS bst_time
+  ),
+  eligible_engineers AS (
+    SELECT 
+      e.ENGINEER_ID,
+      e.LANGUAGE,
+      e.CURRENT_LOAD,
+      e.MAX_TICKETS,
+      e.MAX_TICKETS - e.CURRENT_LOAD AS REMAINING_CAPACITY
+    FROM SUPPORT_AI.TICKETING.SUPPORT_ENGINEERS e, bst_current b
+    WHERE e.CURRENT_LOAD < e.MAX_TICKETS
+      AND b.bst_time >= TIME(CONVERT_TIMEZONE(e.TIMEZONE, ''Europe/London'', 
+            TIMESTAMP_NTZ_FROM_PARTS(CURRENT_DATE(), e.SHIFT_START)))
+      AND b.bst_time <= TIME(CONVERT_TIMEZONE(e.TIMEZONE, ''Europe/London'', 
+            TIMESTAMP_NTZ_FROM_PARTS(CURRENT_DATE(), e.SHIFT_END)))
+  ),
+  unassigned_tickets AS (
+    SELECT 
+      SUBJECT,
+      LANGUAGE,
+      PRIORITY,
+      ROW_NUMBER() OVER (PARTITION BY LANGUAGE ORDER BY 
+        CASE PRIORITY WHEN ''high'' THEN 1 WHEN ''medium'' THEN 2 WHEN ''low'' THEN 3 END
+      ) AS ticket_rank
+    FROM SUPPORT_AI.TICKETING.TICKETS
+    WHERE ASSIGNED_ENGINEER_ID IS NULL
+  ),
+  ranked_engineers AS (
+    SELECT 
+      ENGINEER_ID,
+      LANGUAGE,
+      CURRENT_LOAD,
+      REMAINING_CAPACITY,
+      ROW_NUMBER() OVER (PARTITION BY LANGUAGE ORDER BY CURRENT_LOAD ASC) AS eng_rank
+    FROM eligible_engineers
+  ),
+  assignments AS (
+    SELECT 
+      t.SUBJECT,
+      t.LANGUAGE,
+      re.ENGINEER_ID,
+      t.ticket_rank,
+      re.REMAINING_CAPACITY,
+      -- Distribute tickets across engineers respecting capacity
+      ROW_NUMBER() OVER (PARTITION BY re.ENGINEER_ID ORDER BY t.ticket_rank) AS tickets_to_this_eng
+    FROM unassigned_tickets t
+    JOIN ranked_engineers re ON t.LANGUAGE = re.LANGUAGE
+    WHERE re.eng_rank = 1
+  )
+  SELECT SUBJECT, ENGINEER_ID
+  FROM assignments
+  WHERE tickets_to_this_eng <= REMAINING_CAPACITY;
+
+  -- Apply assignments
+  UPDATE SUPPORT_AI.TICKETING.TICKETS t
+  SET ASSIGNED_ENGINEER_ID = a.ENGINEER_ID
+  FROM SUPPORT_AI.TICKETING.TEMP_ASSIGNMENTS a
+  WHERE t.SUBJECT = a.SUBJECT
+    AND t.ASSIGNED_ENGINEER_ID IS NULL;
+
+  tickets_assigned := SQLROWCOUNT;
+
+  -- Update engineer loads
+  UPDATE SUPPORT_AI.TICKETING.SUPPORT_ENGINEERS e
+  SET CURRENT_LOAD = e.CURRENT_LOAD + cnt.assigned_count
+  FROM (
+    SELECT ENGINEER_ID, COUNT(*) AS assigned_count
+    FROM SUPPORT_AI.TICKETING.TEMP_ASSIGNMENTS
+    GROUP BY ENGINEER_ID
+  ) cnt
+  WHERE e.ENGINEER_ID = cnt.ENGINEER_ID;
+
+  -- Cleanup
+  DROP TABLE IF EXISTS SUPPORT_AI.TICKETING.TEMP_ASSIGNMENTS;
+
+  RETURN ''Allocation complete. Tickets assigned: '' || :tickets_assigned::VARCHAR;
+END;
+';
